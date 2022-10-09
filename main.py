@@ -2,7 +2,9 @@ import json
 import os
 import base64
 from io import BytesIO, StringIO
+import time
 
+import requests
 import boto3
 import torch
 
@@ -12,36 +14,40 @@ from diffusers import StableDiffusionPipeline
 DEVICE = "cuda"
 HUGGINGFACE_TOKEN = os.environ["HUGGINGFACE_TOKEN"]
 
-def initialize_model_pipeline():
-    pipe = StableDiffusionPipeline.from_pretrained(
-        "CompVis/stable-diffusion-v1-4",
-        revision="fp16", 
-        torch_dtype=torch.float16,
-        use_auth_token=HUGGINGFACE_TOKEN
-    )
+def main():
+    def initialize_model_pipeline():
+        pipe = StableDiffusionPipeline.from_pretrained(
+            "CompVis/stable-diffusion-v1-4",
+            revision="fp16", 
+            torch_dtype=torch.float16,
+            use_auth_token=HUGGINGFACE_TOKEN
+        )
 
-    return pipe.to(DEVICE)
+        return pipe.to(DEVICE)
 
-pipeline = initialize_model_pipeline()
+    pipeline = initialize_model_pipeline()
 
-sqs = boto3.resource("sqs")
-queue = sqs.get_queue_by_name(QueueName="inference-request.fifo")
+    sqs = boto3.resource("sqs", region_name='us-east-1')
+    queue = sqs.get_queue_by_name(QueueName="inference-request.fifo")
 
-messages = queue.receive_messages(WaitTimeSeconds=20, MaxNumberOfMessages=1)
-for message in messages:
-    body = json.loads(message.body)
-    message_id = message.message_id
+    while True:
+        messages = queue.receive_messages(WaitTimeSeconds=20, MaxNumberOfMessages=1)
+        for message in messages:
+            body = json.loads(message.body)
+            message_id = message.message_id
 
-    with autocast("cuda"):
-        images = pipeline(prompt=body["prompt"], strength=0.75, guidance_scale=7.5).images
-        similarity_results = get_similar_images(body["prompt"])
-        upload_to_s3(message_id, images[0], similarity_results)
+            with autocast("cuda"):
+                images = pipeline(prompt=body["prompt"], strength=0.75, guidance_scale=7.5).images
+                similarity_results = get_similar_images(body["prompt"])
+                upload_to_s3(message_id, images[0], similarity_results)
 
-    message.delete()
+            message.delete()
+        time.sleep(5)
 
 # Find similar images to text prompt
 
-SEARCH_URL = 'http://localhost:9753/knn-service' #SEARCH_URL = 'https://knn5.laion.ai/knn-service'
+SEARCH_URL = 'https://knn5.laion.ai/knn-service'
+#SEARCH_URL = 'http://localhost:9753/knn-service'
 
 def get_similar_images(prompt):
     headers = {
@@ -95,3 +101,6 @@ def upload_to_s3(message_id, image, similarity_results):
     file_buffer = BytesIO(json_buffer.getvalue().encode())
     client = boto3.client('s3', region_name='ca-central-1', aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
     client.upload_fileobj(file_buffer, 'fsdl-52-images', message_id + '.json')
+
+if __name__ == "__main__":
+    main()
